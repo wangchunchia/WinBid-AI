@@ -1,0 +1,77 @@
+Metadata-Version: 2.4
+Name: winbid-ai-backend
+Version: 0.1.0
+Summary: Backend scaffold for WinBid-AI automated bid writing system
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: alembic>=1.13.1
+Requires-Dist: fastapi>=0.115.0
+Requires-Dist: openpyxl>=3.1.5
+Requires-Dist: openai>=1.51.0
+Requires-Dist: pillow>=10.4.0
+Requires-Dist: psycopg[binary]>=3.1.19
+Requires-Dist: pymupdf>=1.24.10
+Requires-Dist: pytesseract>=0.3.13
+Requires-Dist: uvicorn[standard]>=0.30.0
+Requires-Dist: xlrd>=2.0.1
+Requires-Dist: pydantic-settings>=2.3.0
+Requires-Dist: sqlalchemy>=2.0.30
+
+# WinBid-AI Backend
+
+FastAPI backend scaffold for the automated bid-writing system.
+
+## Quick Start
+
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+cp .env.example .env
+alembic upgrade head
+uvicorn app.main:app --reload
+```
+
+## PostgreSQL
+
+Default local connection in `.env.example`:
+
+```env
+WINBID_DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/winbid
+```
+
+If you want a local database quickly:
+
+```bash
+docker compose up -d db
+```
+
+## LLM Draft Generation
+
+This project can optionally use the OpenAI Responses API to rewrite rule-based chapter drafts into more formal bid text.
+
+Enable it in `.env`:
+
+```env
+WINBID_OPENAI_ENABLE_DRAFT_GENERATION=true
+WINBID_OPENAI_MODEL=gpt-5-mini
+WINBID_OPENAI_API_KEY=your_api_key
+```
+
+If not enabled, the backend falls back to deterministic draft generation.
+
+## Current Scope
+
+1. Project and API skeleton
+2. PostgreSQL-backed core persistence for projects and materials
+3. Alembic migration scaffold
+4. Core route definitions from the system design
+5. Real document parsing, chunking, and OCR fallback pipeline
+
+## Next Steps
+
+1. Persist clauses, requirements, chapters, and compliance issues
+2. Add object storage integration
+3. Add OCR / parser / agent execution jobs
+4. Replace orchestrator stub outputs with real pipeline execution

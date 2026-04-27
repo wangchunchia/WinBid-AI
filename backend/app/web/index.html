@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WinBid AI Agent Workspace</title>
+    <link rel="stylesheet" href="/ui/assets/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <div class="topbar-title">
+          <div class="logo-mark">WB</div>
+          <div>
+            <p class="kicker">Agent Workspace</p>
+            <h1>WinBid AI 对话式工作台</h1>
+          </div>
+        </div>
+        <div class="project-switcher">
+          <select id="projectSelect"></select>
+          <button id="refreshProjectsBtn" class="ghost-btn">刷新项目</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="chat-stage">
+          <div class="chat-hero">
+            <div>
+              <p class="kicker">Minimal Flow</p>
+              <h2>让 Agent 决定下一步，用户只在需要时补材料或重做模板</h2>
+            </div>
+            <div class="hero-stats">
+              <div>
+                <span>当前动作</span>
+                <strong id="agentState">未加载</strong>
+              </div>
+              <div>
+                <span>计划状态</span>
+                <strong id="planState">未生成</strong>
+              </div>
+            </div>
+          </div>
+
+          <section class="chat-window">
+            <div id="chatThread" class="chat-thread"></div>
+          </section>
+
+          <section class="chat-input-bar">
+            <textarea id="chatInput" placeholder="输入你的问题或指令，例如：继续、我已经上传好了、模板不满意，重做详细版"></textarea>
+            <button id="sendChatBtn" class="primary-action">发送给 Agent</button>
+          </section>
+
+          <section id="materialPanel" class="assistant-panel hidden">
+            <div class="panel-head">
+              <div>
+                <p class="kicker">需要你处理</p>
+                <h3>上传缺失材料</h3>
+              </div>
+              <button id="refreshMissingBtn" class="ghost-btn">刷新缺失项</button>
+            </div>
+            <div id="missingList" class="card-list"></div>
+            <form id="materialForm" class="smart-form">
+              <div class="field-row">
+                <input name="file_name" placeholder="材料文件名" required />
+                <input name="material_type" placeholder="material_type，如 business_license" required />
+              </div>
+              <input name="storage_uri" placeholder="本地路径，如 /Users/.../Ref/营业执照.pdf" required />
+              <input name="material_requirement_id" placeholder="可选：绑定 checklist id" />
+              <button type="submit">上传后继续推进</button>
+            </form>
+          </section>
+
+          <section id="templatePanel" class="assistant-panel hidden">
+            <div class="panel-head">
+              <div>
+                <p class="kicker">如果不满意</p>
+                <h3>重做当前模板</h3>
+              </div>
+            </div>
+            <div class="field-row">
+              <select id="templateMode">
+                <option value="basic">basic</option>
+                <option value="compact">compact</option>
+                <option value="detailed">detailed</option>
+              </select>
+              <label class="checkbox-line"><input id="includeTech" type="checkbox" />技术章节</label>
+              <label class="checkbox-line"><input id="includeAppendix" type="checkbox" />附件章节</label>
+            </div>
+            <textarea id="templateInstruction" placeholder="比如：希望模板更完整，增加重点条款响应表"></textarea>
+            <div class="action-row">
+              <button id="generateTemplateBtn" class="ghost-btn">生成基础模板</button>
+              <button id="regenerateTemplateBtn" class="accent-btn">不满意，重做模板</button>
+            </div>
+          </section>
+
+          <section class="action-dock">
+            <button id="primaryActionBtn" class="primary-action">开始使用</button>
+            <div class="dock-actions">
+              <button id="generatePlanBtn" class="ghost-btn">刷新计划</button>
+              <button id="solveStepBtn" class="ghost-btn">只执行一步</button>
+              <button id="loadDashboardBtn" class="ghost-btn">刷新状态</button>
+            </div>
+          </section>
+        </section>
+
+        <aside class="insight-rail">
+          <section class="rail-card">
+            <div class="panel-head">
+              <div>
+                <p class="kicker">项目入口</p>
+                <h3>创建项目与登记文件</h3>
+              </div>
+            </div>
+            <form id="projectForm" class="smart-form">
+              <input name="project_name" placeholder="项目名称" required />
+              <input name="project_code" placeholder="项目编号" required />
+              <div class="field-row">
+                <input name="bidder_company_id" placeholder="投标公司 ID，可选" />
+                <input name="procurement_method" placeholder="competitive_negotiation" />
+              </div>
+              <button type="submit">创建项目</button>
+            </form>
+            <form id="documentForm" class="smart-form top-gap">
+              <input name="file_name" placeholder="入口文件名" required />
+              <input name="storage_uri" placeholder="本地路径，如 /Users/.../Ref/xx.doc" required />
+              <div class="field-row">
+                <input name="file_type" placeholder="doc/pdf/docx/xls" required />
+                <select name="doc_role">
+                  <option value="tender_main">tender_main</option>
+                  <option value="appendix">appendix</option>
+                  <option value="clarification">clarification</option>
+                </select>
+              </div>
+              <button type="submit">登记招标文件</button>
+            </form>
+          </section>
+
+          <section class="rail-card">
+            <div class="panel-head">
+              <div>
+                <p class="kicker">当前模板</p>
+                <h3>结构模板</h3>
+              </div>
+            </div>
+            <div id="templateRationale" class="hint-box">Agent 生成模板后会在这里解释原因。</div>
+            <div id="templateList" class="card-list"></div>
+          </section>
+
+          <section class="rail-card">
+            <div class="panel-head">
+              <div>
+                <p class="kicker">Agent Plan</p>
+                <h3>计划步骤</h3>
+              </div>
+            </div>
+            <div id="planBoard" class="card-list compact"></div>
+          </section>
+
+          <section class="rail-card">
+            <div class="panel-head">
+              <div>
+                <p class="kicker">结果面板</p>
+                <h3>草稿与风险</h3>
+              </div>
+            </div>
+            <div id="draftsList" class="card-list compact"></div>
+            <div id="complianceSummary" class="hint-box top-gap">尚未执行合规检查。</div>
+            <div id="complianceList" class="card-list compact"></div>
+          </section>
+
+          <section class="rail-card">
+            <div class="panel-head">
+              <div>
+                <p class="kicker">Debug</p>
+                <h3>Checklist 与材料</h3>
+              </div>
+            </div>
+            <div id="checklistSummary" class="hint-box">尚未生成清单。</div>
+            <div id="checklistList" class="card-list compact"></div>
+            <div id="materialsList" class="card-list compact top-gap"></div>
+          </section>
+
+          <section class="rail-card log-card">
+            <div class="panel-head">
+              <div>
+                <p class="kicker">Console</p>
+                <h3>操作日志</h3>
+              </div>
+            </div>
+            <pre id="logOutput"></pre>
+          </section>
+        </aside>
+      </main>
+    <script src="/ui/assets/app.js"></script>
+  </body>
+</html>
