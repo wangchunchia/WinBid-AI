@@ -1,5 +1,7 @@
 from app.models.domain import (
+    AgentMessage,
     AgentRun,
+    AgentTask,
     Chapter,
     Clause,
     ComplianceIssue,
@@ -17,7 +19,9 @@ from app.models.domain import (
 )
 
 __all__ = [
+    "AgentMessage",
     "AgentRun",
+    "AgentTask",
     "Chapter",
     "Clause",
     "ComplianceIssue",

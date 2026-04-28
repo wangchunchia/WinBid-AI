@@ -4,6 +4,7 @@ const state = {
   projects: [],
   projectId: "",
   planId: null,
+  activeStreamId: null,
   chatSessionId: null,
   chatSession: null,
   agentDecision: null,
@@ -76,6 +77,10 @@ async function request(path, options = {}) {
     throw new Error(detail || `Request failed: ${response.status}`);
   }
   return data;
+}
+
+function normalizeErrorMessage(error) {
+  return error?.message || String(error);
 }
 
 function escapeHtml(value) {
@@ -347,6 +352,103 @@ function renderChat() {
   els.templatePanel.classList.toggle("hidden", !state.latestTemplate.length);
 }
 
+function applySolveResponse(result) {
+  state.latestPlan = result.plan;
+  state.planId = result.plan.plan_id;
+}
+
+function applyChatResponse(result) {
+  state.chatSession = result.session;
+  state.chatSessionId = result.session.session_id;
+  state.agentDecision = result.decision;
+  if (result.solve_result) {
+    applySolveResponse(result.solve_result);
+  }
+}
+
+function applyPlanResponse(result) {
+  renderPlan(result.plan);
+}
+
+function applyStreamResult(kind, result) {
+  if (kind === "chat") {
+    applyChatResponse(result);
+    return;
+  }
+  if (kind === "plan") {
+    applyPlanResponse(result);
+    return;
+  }
+  if (kind === "solve" || kind === "solve-step") {
+    applySolveResponse(result);
+  }
+}
+
+async function startAgentStream(path, payload, kind) {
+  ensureProject();
+  const started = await request(path, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  state.activeStreamId = started.stream_id;
+  log("已启动 SSE 任务", { kind, stream_id: started.stream_id });
+
+  await new Promise((resolve, reject) => {
+    const source = new EventSource(started.stream_url);
+    let settled = false;
+
+    const finalize = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      state.activeStreamId = null;
+      source.close();
+      fn(value);
+    };
+
+    source.addEventListener("connected", () => {
+      log("SSE 已连接", { kind, stream_id: started.stream_id });
+    });
+
+    source.addEventListener("task_update", (event) => {
+      const data = JSON.parse(event.data);
+      log("任务进度", data);
+    });
+
+    source.addEventListener("agent_message", (event) => {
+      const data = JSON.parse(event.data);
+      log("Agent 消息", data);
+    });
+
+    source.addEventListener("run_started", (event) => {
+      const data = JSON.parse(event.data);
+      log("任务开始执行", data);
+    });
+
+    source.addEventListener("result", async (event) => {
+      const data = JSON.parse(event.data);
+      applyStreamResult(kind, data);
+      log("SSE 任务完成", { kind, stream_id: started.stream_id });
+      try {
+        await loadWorkspace(kind === "chat");
+        finalize(resolve);
+      } catch (error) {
+        finalize(reject, error);
+      }
+    });
+
+    source.addEventListener("run_error", (event) => {
+      const payloadData = JSON.parse(event.data);
+      finalize(reject, new Error(payloadData.message || "SSE 连接失败"));
+    });
+
+    source.onerror = () => {
+      if (!settled) {
+        finalize(reject, new Error("SSE 连接中断"));
+      }
+    };
+  });
+}
+
 async function createProject(event) {
   event.preventDefault();
   const payload = formToObject(els.projectForm);
@@ -465,40 +567,21 @@ async function loadChatSession() {
 }
 
 async function sendChatMessage(messageText) {
-  ensureProject();
   const text = (messageText || els.chatInput.value || "").trim();
   if (!text) return;
-  const result = await request(`${API_PREFIX}/projects/${state.projectId}/agent/chat`, {
-    method: "POST",
-    body: JSON.stringify({
-      session_id: state.chatSessionId,
-      user_message: text,
-      auto_execute: true,
-    }),
-  });
-  state.chatSession = result.session;
-  state.chatSessionId = result.session.session_id;
-  state.agentDecision = result.decision;
-  if (result.solve_result) {
-    state.latestPlan = result.solve_result.plan;
-    state.planId = result.solve_result.plan.plan_id;
-  }
+  await startAgentStream(`${API_PREFIX}/projects/${state.projectId}/agent/chat/stream`, {
+    session_id: state.chatSessionId,
+    user_message: text,
+    auto_execute: true,
+  }, "chat");
   els.chatInput.value = "";
-  log("会话 Agent 已回复", result);
-  await loadWorkspace(true);
 }
 
 async function generatePlan() {
-  ensureProject();
-  const result = await request(`${API_PREFIX}/projects/${state.projectId}/agent/plan`, {
-    method: "POST",
-    body: JSON.stringify({
-      goal: "完成可审阅的投标文件草稿并通过基础合规检查",
-      refresh_existing: true,
-    }),
-  });
-  log("已刷新计划", result);
-  renderPlan(result.plan);
+  await startAgentStream(`${API_PREFIX}/projects/${state.projectId}/agent/plan/stream`, {
+    goal: "完成可审阅的投标文件草稿并通过基础合规检查",
+    refresh_existing: true,
+  }, "plan");
 }
 
 async function loadPlan() {
@@ -512,14 +595,10 @@ async function loadPlan() {
 }
 
 async function solveStep() {
-  ensureProject();
-  const result = await request(`${API_PREFIX}/projects/${state.projectId}/agent/solve-step`, {
-    method: "POST",
-    body: JSON.stringify({ plan_id: state.planId, step_code: null }),
-  });
-  log("已执行一步", result);
-  renderPlan(result.plan);
-  await loadWorkspace();
+  await startAgentStream(`${API_PREFIX}/projects/${state.projectId}/agent/solve-step/stream`, {
+    plan_id: state.planId,
+    step_code: null,
+  }, "solve-step");
 }
 
 async function solvePlan() {
@@ -603,8 +682,9 @@ function focusCompliancePanel() {
 }
 
 function notifyError(error) {
-  log("操作失败", error.message || String(error));
-  alert(error.message || String(error));
+  const message = normalizeErrorMessage(error);
+  log("操作失败", message);
+  alert(message);
 }
 
 function wireEvents() {

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.models.domain import Chapter, Clause, ComplianceIssue, MaterialRequirement, Requirement, SourceDocument, UserMaterial
 from app.schemas.bid_agent import AgentActionPayload, BidProjectAgentDecision, ProjectStatusSnapshot
+from app.services.project_memory_service import ProjectMemoryPolicy, project_memory_service
 
 
 class BidProjectAgentService:
@@ -14,13 +15,14 @@ class BidProjectAgentService:
 
     def get_next_action(self, db: Session, project_id: str) -> BidProjectAgentDecision:
         snapshot = self.build_snapshot(db, project_id)
+        memory_policy = project_memory_service.resolve_policy(db, project_id)
 
         if self._settings.openai_enable_agent_decision and self._settings.openai_api_key:
             llm_decision = self._try_llm_decision(snapshot)
             if llm_decision:
-                return llm_decision
+                return self._apply_memory_policy(llm_decision, memory_policy)
 
-        return self._heuristic_decision(snapshot)
+        return self._apply_memory_policy(self._heuristic_decision(snapshot), memory_policy)
 
     def build_snapshot(self, db: Session, project_id: str) -> ProjectStatusSnapshot:
         from app.models.domain import TenderProject
@@ -374,6 +376,58 @@ class BidProjectAgentService:
             "5. 如果尚未解析、尚未生成清单、尚未生成草稿或尚未检查合规，应优先补齐流程。\n\n"
             f"项目状态快照：\n{snapshot.model_dump_json(indent=2)}\n"
         )
+
+    def _apply_memory_policy(
+        self,
+        decision: BidProjectAgentDecision,
+        memory_policy: ProjectMemoryPolicy,
+    ) -> BidProjectAgentDecision:
+        notes = list(decision.action_payload.notes)
+        assessment = decision.current_assessment
+        reason = decision.reason
+        requires_user_input = decision.requires_user_input
+        confidence = decision.confidence
+        chapter_codes = list(decision.action_payload.chapter_codes)
+
+        if decision.next_action == "upload_missing_materials" and memory_policy.user_claimed_upload_done:
+            notes.append("用户曾声明资料已上传，但系统当前仍识别出缺失材料，需要重新核对清单与上传结果。")
+            reason = f"{reason} 用户口头确认不会覆盖数据库中的缺失材料状态。"
+
+        if decision.next_action == "generate_chapter_draft" and memory_policy.defer_pricing_chapter and "C04" in chapter_codes:
+            chapter_codes = [code for code in chapter_codes if code != "C04"]
+            notes.append("根据用户指令，报价章节当前不进入自动生成。")
+            if not chapter_codes:
+                requires_user_input = True
+                assessment = f"{assessment} 但报价章节被用户显式暂缓。"
+                reason = "当前可自动生成的目标章节被 memory 约束阻止，需要等待用户解除报价章节限制。"
+                confidence = min(confidence, 0.88)
+
+        if decision.next_action == "ready_for_export" and (memory_policy.defer_export or memory_policy.prefer_manual_review):
+            requires_user_input = True
+            confidence = min(confidence, 0.86)
+            if memory_policy.defer_export:
+                notes.append("memory 约束：用户要求暂不导出。")
+            if memory_policy.prefer_manual_review:
+                notes.append("memory 约束：用户要求先人工复核。")
+            assessment = f"{assessment} 但当前存在用户给出的导出限制。"
+            reason = "数据库状态已满足导出前提，但 memory 中存在人工复核或暂不导出的明确指令，不能直接继续自动导出。"
+
+        if memory_policy.preferred_next_action and memory_policy.preferred_next_action != decision.next_action:
+            notes.append(f"用户曾表达优先动作偏好：{memory_policy.preferred_next_action}。")
+
+        decision.current_assessment = assessment
+        decision.reason = reason
+        decision.requires_user_input = requires_user_input
+        decision.confidence = confidence
+        decision.action_payload = AgentActionPayload(
+            endpoint=decision.action_payload.endpoint,
+            method=decision.action_payload.method,
+            chapter_codes=chapter_codes,
+            missing_material_types=decision.action_payload.missing_material_types,
+            blocking_issue_codes=decision.action_payload.blocking_issue_codes,
+            notes=notes,
+        )
+        return decision
 
 
 bid_project_agent_service = BidProjectAgentService()

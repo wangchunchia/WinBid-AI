@@ -27,6 +27,7 @@ from app.services.checklist_service import checklist_service
 from app.services.compliance_service import compliance_service
 from app.services.draft_service import draft_service
 from app.services.orchestrator_service import orchestrator_service
+from app.services.project_memory_service import ProjectMemoryPolicy, project_memory_service
 
 
 class PlanAndSolveService:
@@ -34,8 +35,9 @@ class PlanAndSolveService:
         existing = self.get_latest_plan(db, project_id)
         if existing and not payload.refresh_existing:
             snapshot = bid_project_agent_service.build_snapshot(db, project_id)
-            self._reconcile_steps(db, existing, snapshot)
-            self._refresh_plan_state(db, existing, snapshot)
+            memory_policy = project_memory_service.resolve_policy(db, project_id)
+            self._reconcile_steps(db, existing, snapshot, memory_policy)
+            self._refresh_plan_state(db, existing, snapshot, memory_policy)
             db.commit()
             return AgentPlanResponse(
                 project_id=project_id,
@@ -47,20 +49,21 @@ class PlanAndSolveService:
             existing.plan_status = "superseded"
 
         snapshot = bid_project_agent_service.build_snapshot(db, project_id)
+        memory_policy = project_memory_service.resolve_policy(db, project_id)
         plan = ProjectPlan(
             id=str(uuid4()),
             project_id=project_id,
             goal=payload.goal,
             plan_status="in_progress",
             current_step_code=None,
-            overall_assessment=self._build_assessment(snapshot),
+            overall_assessment=self._build_assessment(snapshot, memory_policy),
             blocking_reason=None,
             requires_user_input=False,
         )
         db.add(plan)
         db.flush()
 
-        for step_view in self._build_plan_steps(snapshot):
+        for step_view in self._build_plan_steps(snapshot, memory_policy):
             db.add(
                 PlanStep(
                     id=str(uuid4()),
@@ -80,7 +83,7 @@ class PlanAndSolveService:
             )
 
         db.flush()
-        self._refresh_plan_state(db, plan, snapshot)
+        self._refresh_plan_state(db, plan, snapshot, memory_policy)
         db.commit()
         return AgentPlanResponse(
             project_id=project_id,
@@ -101,8 +104,9 @@ class PlanAndSolveService:
         if plan is None:
             return None
         snapshot = bid_project_agent_service.build_snapshot(db, project_id)
-        self._reconcile_steps(db, plan, snapshot)
-        self._refresh_plan_state(db, plan, snapshot)
+        memory_policy = project_memory_service.resolve_policy(db, project_id)
+        self._reconcile_steps(db, plan, snapshot, memory_policy)
+        self._refresh_plan_state(db, plan, snapshot, memory_policy)
         db.commit()
         return self._to_plan_view(db, plan, snapshot)
 
@@ -115,10 +119,11 @@ class PlanAndSolveService:
                 raise ValueError("Unable to initialize plan")
 
         snapshot_before = bid_project_agent_service.build_snapshot(db, project_id)
-        self._reconcile_steps(db, plan, snapshot_before)
+        memory_policy = project_memory_service.resolve_policy(db, project_id)
+        self._reconcile_steps(db, plan, snapshot_before, memory_policy)
         step = self._select_step(db, plan, payload.step_code)
         if step is None:
-            self._refresh_plan_state(db, plan, snapshot_before)
+            self._refresh_plan_state(db, plan, snapshot_before, memory_policy)
             db.commit()
             return SolveStepResponse(
                 project_id=project_id,
@@ -132,7 +137,7 @@ class PlanAndSolveService:
 
         if step.requires_user_input:
             step.status = "blocked"
-            self._refresh_plan_state(db, plan, snapshot_before)
+            self._refresh_plan_state(db, plan, snapshot_before, memory_policy)
             db.commit()
             return SolveStepResponse(
                 project_id=project_id,
@@ -146,7 +151,7 @@ class PlanAndSolveService:
 
         if not self._dependencies_completed(step, self._load_steps(db, plan.id)):
             step.status = "pending"
-            self._refresh_plan_state(db, plan, snapshot_before)
+            self._refresh_plan_state(db, plan, snapshot_before, memory_policy)
             db.commit()
             return SolveStepResponse(
                 project_id=project_id,
@@ -176,8 +181,9 @@ class PlanAndSolveService:
             step.requires_user_input = True
 
         snapshot_after = bid_project_agent_service.build_snapshot(db, project_id)
-        self._reconcile_steps(db, plan, snapshot_after)
-        self._refresh_plan_state(db, plan, snapshot_after)
+        memory_policy_after = project_memory_service.resolve_policy(db, project_id)
+        self._reconcile_steps(db, plan, snapshot_after, memory_policy_after)
+        self._refresh_plan_state(db, plan, snapshot_after, memory_policy_after)
         db.commit()
 
         return SolveStepResponse(
@@ -267,7 +273,7 @@ class PlanAndSolveService:
             )
         return self.get_latest_plan(db, project_id)
 
-    def _build_plan_steps(self, snapshot: ProjectStatusSnapshot) -> list[PlanStepView]:
+    def _build_plan_steps(self, snapshot: ProjectStatusSnapshot, memory_policy: ProjectMemoryPolicy) -> list[PlanStepView]:
         steps: list[PlanStepView] = [
             self._make_step(
                 step_code="S01",
@@ -302,7 +308,12 @@ class PlanAndSolveService:
                 title="补齐缺失材料",
                 action_name="upload_missing_materials",
                 step_order=4,
-                payload=PlanStepPayload(notes=["优先补齐 mandatory、risk 类材料。"]),
+                payload=PlanStepPayload(
+                    notes=self._merge_notes(
+                        ["优先补齐 mandatory、risk 类材料。"],
+                        ["用户曾声明资料已上传，执行前应先复核缺失清单。"] if memory_policy.user_claimed_upload_done else [],
+                    )
+                ),
                 depends_on=["S03"],
                 status="completed" if snapshot.checklist_item_count > 0 and snapshot.missing_material_count == 0 else "pending",
                 requires_user_input=snapshot.checklist_item_count > 0 and snapshot.missing_material_count > 0,
@@ -322,16 +333,25 @@ class PlanAndSolveService:
         for order_offset, (step_code, title, chapter_code) in enumerate(chapter_specs, start=5):
             available = chapter_code in snapshot.available_chapter_codes
             generated = chapter_code in snapshot.generated_chapter_codes
+            blocked_by_memory = chapter_code == "C04" and memory_policy.defer_pricing_chapter and available
             steps.append(
                 self._make_step(
                     step_code=step_code,
                     title=title,
                     action_name="generate_chapter_draft",
                     step_order=order_offset,
-                    payload=PlanStepPayload(chapter_codes=[chapter_code]),
+                    payload=PlanStepPayload(
+                        chapter_codes=[chapter_code],
+                        notes=["根据用户记忆约束，报价章节暂不自动生成。"] if blocked_by_memory else [],
+                    ),
                     depends_on=["S04"],
-                    status="completed" if generated else ("pending" if available else "skipped"),
-                    blocking_reason="当前项目未识别到对应章节。" if not available else None,
+                    status="completed" if generated else ("blocked" if blocked_by_memory else ("pending" if available else "skipped")),
+                    requires_user_input=blocked_by_memory,
+                    blocking_reason=(
+                        "当前项目未识别到对应章节。"
+                        if not available
+                        else ("用户要求暂缓报价章节自动生成。" if blocked_by_memory else None)
+                    ),
                 )
             )
 
@@ -370,9 +390,21 @@ class PlanAndSolveService:
                 title="进入导出准备状态",
                 action_name="ready_for_export",
                 step_order=10,
-                payload=PlanStepPayload(notes=["建议先人工复核文本、材料和风险报告。"]),
+                payload=PlanStepPayload(
+                    notes=self._merge_notes(
+                        ["建议先人工复核文本、材料和风险报告。"],
+                        ["用户明确要求暂不导出。"] if memory_policy.defer_export else [],
+                        ["用户明确要求先人工复核。"] if memory_policy.prefer_manual_review else [],
+                    )
+                ),
                 depends_on=["S09"],
-                status="completed" if snapshot.project_status == "ready_for_export" else "pending",
+                status=(
+                    "completed"
+                    if snapshot.project_status == "ready_for_export"
+                    else ("blocked" if memory_policy.defer_export or memory_policy.prefer_manual_review else "pending")
+                ),
+                requires_user_input=memory_policy.defer_export or memory_policy.prefer_manual_review,
+                blocking_reason=self._export_blocking_reason(memory_policy),
             )
         )
         return steps
@@ -497,7 +529,13 @@ class PlanAndSolveService:
             return ("项目已进入导出准备状态。", {"project_status": "ready_for_export"})
         raise ValueError(f"当前步骤需要用户操作，不能自动执行：{step.action_name}")
 
-    def _reconcile_steps(self, db: Session, plan: ProjectPlan, snapshot: ProjectStatusSnapshot) -> None:
+    def _reconcile_steps(
+        self,
+        db: Session,
+        plan: ProjectPlan,
+        snapshot: ProjectStatusSnapshot,
+        memory_policy: ProjectMemoryPolicy,
+    ) -> None:
         step_by_code = {step.step_code: step for step in self._load_steps(db, plan.id)}
 
         self._set_step_from_snapshot(
@@ -530,6 +568,16 @@ class PlanAndSolveService:
             step = step_by_code.get(step_code)
             if step is None:
                 continue
+            if (
+                chapter_code == "C04"
+                and memory_policy.defer_pricing_chapter
+                and chapter_code in snapshot.available_chapter_codes
+                and chapter_code not in snapshot.generated_chapter_codes
+            ):
+                step.status = "blocked"
+                step.blocking_reason = "用户要求暂缓报价章节自动生成。"
+                step.requires_user_input = True
+                continue
             if chapter_code not in snapshot.available_chapter_codes:
                 step.status = "skipped"
                 step.blocking_reason = "当前项目未识别到对应章节。"
@@ -560,6 +608,8 @@ class PlanAndSolveService:
         self._set_step_from_snapshot(
             step_by_code.get("S10"),
             completed=snapshot.project_status == "ready_for_export",
+            blocked=(memory_policy.defer_export or memory_policy.prefer_manual_review) and snapshot.project_status != "ready_for_export",
+            blocking_reason=self._export_blocking_reason(memory_policy),
         )
 
     def _set_step_from_snapshot(
@@ -588,7 +638,13 @@ class PlanAndSolveService:
             step.requires_user_input = False
             step.blocking_reason = None
 
-    def _refresh_plan_state(self, db: Session, plan: ProjectPlan, snapshot: ProjectStatusSnapshot) -> None:
+    def _refresh_plan_state(
+        self,
+        db: Session,
+        plan: ProjectPlan,
+        snapshot: ProjectStatusSnapshot,
+        memory_policy: ProjectMemoryPolicy,
+    ) -> None:
         steps = self._load_steps(db, plan.id)
         current_step = next((step for step in steps if step.status in {"blocked", "pending"}), None)
         if current_step is None:
@@ -606,26 +662,65 @@ class PlanAndSolveService:
             plan.current_step_code = current_step.step_code
             plan.requires_user_input = False
             plan.blocking_reason = None
-        plan.overall_assessment = self._build_assessment(snapshot)
+        plan.overall_assessment = self._build_assessment(snapshot, memory_policy)
 
-    def _build_assessment(self, snapshot: ProjectStatusSnapshot) -> str:
+    def _build_assessment(self, snapshot: ProjectStatusSnapshot, memory_policy: ProjectMemoryPolicy) -> str:
         if snapshot.tender_document_count == 0:
-            return "项目尚未接入招标文件，当前阻塞在文档登记阶段。"
+            assessment = "项目尚未接入招标文件，当前阻塞在文档登记阶段。"
+            return self._append_memory_assessment(assessment, memory_policy)
         if snapshot.parsed_document_count == 0 or snapshot.clause_count == 0:
-            return "已接入招标文件，但尚未形成有效解析结果。"
+            assessment = "已接入招标文件，但尚未形成有效解析结果。"
+            return self._append_memory_assessment(assessment, memory_policy)
         if snapshot.checklist_item_count == 0:
-            return "解析已完成，但尚未生成投标材料清单。"
+            assessment = "解析已完成，但尚未生成投标材料清单。"
+            return self._append_memory_assessment(assessment, memory_policy)
         if snapshot.missing_material_count > 0:
-            return f"材料清单已生成，但仍缺少 {snapshot.missing_material_count} 项关键材料。"
+            assessment = f"材料清单已生成，但仍缺少 {snapshot.missing_material_count} 项关键材料。"
+            return self._append_memory_assessment(assessment, memory_policy)
         if len(snapshot.generated_chapter_codes) == 0:
-            return "材料已基本齐备，尚未生成核心章节草稿。"
+            assessment = "材料已基本齐备，尚未生成核心章节草稿。"
+            return self._append_memory_assessment(assessment, memory_policy)
         if snapshot.project_status not in {"compliance_checked", "ready_for_export"}:
-            return "章节草稿已生成，但尚未完成基础合规检查。"
+            assessment = "章节草稿已生成，但尚未完成基础合规检查。"
+            return self._append_memory_assessment(assessment, memory_policy)
         if snapshot.fatal_issue_count > 0 or snapshot.high_issue_count > 0:
-            return f"当前存在 {snapshot.fatal_issue_count} 个 fatal 和 {snapshot.high_issue_count} 个 high 风险问题。"
+            assessment = f"当前存在 {snapshot.fatal_issue_count} 个 fatal 和 {snapshot.high_issue_count} 个 high 风险问题。"
+            return self._append_memory_assessment(assessment, memory_policy)
         if snapshot.project_status == "ready_for_export":
-            return "项目已满足导出前置条件。"
-        return "项目已经完成主要步骤，适合进入导出准备阶段。"
+            assessment = "项目已满足导出前置条件。"
+            return self._append_memory_assessment(assessment, memory_policy)
+        assessment = "项目已经完成主要步骤，适合进入导出准备阶段。"
+        return self._append_memory_assessment(assessment, memory_policy)
+
+    def _append_memory_assessment(self, assessment: str, memory_policy: ProjectMemoryPolicy) -> str:
+        memory_notes: list[str] = []
+        if memory_policy.defer_pricing_chapter:
+            memory_notes.append("报价章节当前被用户记忆约束暂缓。")
+        if memory_policy.defer_export:
+            memory_notes.append("导出当前被用户记忆约束暂停。")
+        if memory_policy.prefer_manual_review:
+            memory_notes.append("进入导出前需先人工复核。")
+        if not memory_notes:
+            return assessment
+        return f"{assessment} {' '.join(memory_notes)}"
+
+    def _export_blocking_reason(self, memory_policy: ProjectMemoryPolicy) -> str | None:
+        reasons: list[str] = []
+        if memory_policy.defer_export:
+            reasons.append("用户要求暂不导出")
+        if memory_policy.prefer_manual_review:
+            reasons.append("用户要求先人工复核")
+        if not reasons:
+            return None
+        return "；".join(reasons) + "。"
+
+    def _merge_notes(self, *groups: list[str]) -> list[str]:
+        merged: list[str] = []
+        for group in groups:
+            for note in group:
+                if note and note not in merged:
+                    merged.append(note)
+        return merged
 
     def _to_plan_view(self, db: Session, plan: ProjectPlan, snapshot: ProjectStatusSnapshot) -> ProjectPlanView:
         steps = self._load_steps(db, plan.id)

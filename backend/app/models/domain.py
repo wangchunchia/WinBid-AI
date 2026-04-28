@@ -273,3 +273,35 @@ class AgentRun(Base, TimestampMixin):
     model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     run_status: Mapped[str] = mapped_column(String(32), default="success")
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class AgentTask(Base, TimestampMixin):
+    __tablename__ = "agent_tasks"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(64), index=True)
+    session_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    parent_task_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    depends_on_task_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    agent_name: Mapped[str] = mapped_column(String(64), index=True)
+    task_type: Mapped[str] = mapped_column(String(64), index=True)
+    assigned_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    input_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    task_status: Mapped[str] = mapped_column(String(32), default="queued")
+    blocking_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class AgentMessage(Base, TimestampMixin):
+    __tablename__ = "agent_messages"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(64), index=True)
+    session_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    from_agent: Mapped[str] = mapped_column(String(64), index=True)
+    to_agent: Mapped[str] = mapped_column(String(64), index=True)
+    message_type: Mapped[str] = mapped_column(String(64), index=True)
+    content: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivery_status: Mapped[str] = mapped_column(String(32), default="delivered")

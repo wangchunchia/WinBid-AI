@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from datetime import datetime
 from uuid import uuid4
 
@@ -17,11 +18,10 @@ from app.schemas.bid_agent import (
     UploadPromptItem,
 )
 from app.schemas.checklist import MissingChecklistItem
-from app.schemas.parse import StructureTemplateRequest
 from app.services.bid_project_agent_service import bid_project_agent_service
 from app.services.checklist_service import checklist_service
 from app.services.parse_result_service import parse_result_service
-from app.services.plan_and_solve_service import plan_and_solve_service
+from app.services.project_memory_service import project_memory_service
 
 
 class ChatAgentService:
@@ -60,7 +60,13 @@ class ChatAgentService:
         session = self.get_or_create_session(db, project_id, session_id)
         return self._to_session_view(db, session)
 
-    def chat(self, db: Session, project_id: str, payload: AgentChatRequest) -> AgentChatResponse:
+    def chat(
+        self,
+        db: Session,
+        project_id: str,
+        payload: AgentChatRequest,
+        progress_callback: Callable[[str, dict], None] | None = None,
+    ) -> AgentChatResponse:
         session = self.get_or_create_session(db, project_id, payload.session_id)
         user_message = self._append_message(
             db,
@@ -71,10 +77,10 @@ class ChatAgentService:
             related_action=None,
             metadata={},
         )
-        self._capture_memories(db, session, user_message)
+        project_memory_service.capture_memories(db, session, user_message)
 
         decision = bid_project_agent_service.get_next_action(db, project_id)
-        retrieved_memories = self._retrieve_memories(db, project_id, payload.user_message)
+        retrieved_memories = project_memory_service.retrieve_memories(db, project_id, payload.user_message)
         upload_prompts: list[UploadPromptItem] = []
         solve_result = None
         assistant_text = ""
@@ -82,10 +88,14 @@ class ChatAgentService:
 
         user_intent = user_message.intent or "general"
         if user_intent in {"continue", "upload_done"} and payload.auto_execute:
-            solve_result = plan_and_solve_service.solve(
+            from app.services.multi_agent_service import multi_agent_service
+
+            solve_result = multi_agent_service.coordinate_solve(
                 db,
                 project_id,
                 SolveRequest(plan_id=None, max_steps=8),
+                session_id=session.id,
+                progress_callback=progress_callback,
             )
             decision = bid_project_agent_service.get_next_action(db, project_id)
             assistant_text = self._format_solve_reply(solve_result, decision)
@@ -94,7 +104,7 @@ class ChatAgentService:
             template_response = parse_result_service.generate_structure_template(
                 db,
                 project_id,
-                self._build_template_request(payload.user_message),
+                project_memory_service.build_template_request_from_text(db, project_id, payload.user_message),
                 regenerated=True,
             )
             decision = bid_project_agent_service.get_next_action(db, project_id)
@@ -223,177 +233,6 @@ class ChatAgentService:
         if any(word in normalized for word in ("现在什么情况", "当前状态", "进展", "到哪一步")):
             return "status"
         return "general"
-
-    def _capture_memories(self, db: Session, session: ProjectChatSession, message: ProjectChatMessage) -> None:
-        text = message.content.strip()
-        candidates: list[dict[str, object]] = []
-
-        if any(word in text for word in ("精简", "简洁")):
-            candidates.append(
-                {
-                    "memory_type": "template_preference",
-                    "memory_key": "template_mode",
-                    "title": "用户偏好精简模板",
-                    "content": text,
-                    "tags": ["template", "compact"],
-                    "importance_score": 4,
-                }
-            )
-        if any(word in text for word in ("详细", "完整")):
-            candidates.append(
-                {
-                    "memory_type": "template_preference",
-                    "memory_key": "template_mode",
-                    "title": "用户偏好详细模板",
-                    "content": text,
-                    "tags": ["template", "detailed"],
-                    "importance_score": 4,
-                }
-            )
-        if any(word in text for word in ("技术章节", "加技术")):
-            candidates.append(
-                {
-                    "memory_type": "template_preference",
-                    "memory_key": "include_technical_chapter",
-                    "title": "用户要求加入技术章节",
-                    "content": text,
-                    "tags": ["template", "technical"],
-                    "importance_score": 3,
-                }
-            )
-        if any(word in text for word in ("附件", "补充材料")):
-            candidates.append(
-                {
-                    "memory_type": "template_preference",
-                    "memory_key": "include_appendix_chapter",
-                    "title": "用户要求加入附件章节",
-                    "content": text,
-                    "tags": ["template", "appendix"],
-                    "importance_score": 3,
-                }
-            )
-        if any(word in text for word in ("上传好了", "已上传", "补齐了", "传完了")):
-            candidates.append(
-                {
-                    "memory_type": "workflow_update",
-                    "memory_key": "user_claimed_upload_done",
-                    "title": "用户声明已上传资料",
-                    "content": text,
-                    "tags": ["materials", "upload"],
-                    "importance_score": 3,
-                }
-            )
-        if any(word in text for word in ("不要", "优先", "先做", "先不要")):
-            candidates.append(
-                {
-                    "memory_type": "user_instruction",
-                    "memory_key": f"user_instruction:{uuid4().hex[:8]}",
-                    "title": "用户流程指令",
-                    "content": text,
-                    "tags": ["instruction"],
-                    "importance_score": 2,
-                }
-            )
-
-        for candidate in candidates:
-            self._upsert_memory(
-                db,
-                project_id=session.project_id,
-                session_id=session.id,
-                source_message_id=message.id,
-                memory_type=str(candidate["memory_type"]),
-                memory_key=str(candidate["memory_key"]),
-                title=str(candidate["title"]),
-                content=str(candidate["content"]),
-                tags=list(candidate["tags"]),
-                importance_score=int(candidate["importance_score"]),
-            )
-
-    def _upsert_memory(
-        self,
-        db: Session,
-        project_id: str,
-        session_id: str,
-        source_message_id: str,
-        memory_type: str,
-        memory_key: str,
-        title: str,
-        content: str,
-        tags: list[str],
-        importance_score: int,
-    ) -> None:
-        existing = db.scalar(
-            select(ProjectMemoryItem)
-            .where(
-                ProjectMemoryItem.project_id == project_id,
-                ProjectMemoryItem.memory_key == memory_key,
-                ProjectMemoryItem.status == "active",
-            )
-            .limit(1)
-        )
-        if existing:
-            existing.session_id = session_id
-            existing.title = title
-            existing.content = content
-            existing.tags_json = json.dumps(tags, ensure_ascii=False)
-            existing.source_message_id = source_message_id
-            existing.importance_score = importance_score
-            return
-
-        db.add(
-            ProjectMemoryItem(
-                id=str(uuid4()),
-                project_id=project_id,
-                session_id=session_id,
-                memory_type=memory_type,
-                memory_key=memory_key,
-                title=title,
-                content=content,
-                tags_json=json.dumps(tags, ensure_ascii=False),
-                source_message_id=source_message_id,
-                importance_score=importance_score,
-                status="active",
-            )
-        )
-
-    def _retrieve_memories(self, db: Session, project_id: str, query: str) -> list[ProjectMemoryItem]:
-        memories = db.scalars(
-            select(ProjectMemoryItem)
-            .where(ProjectMemoryItem.project_id == project_id, ProjectMemoryItem.status == "active")
-            .order_by(ProjectMemoryItem.updated_at.desc())
-        ).all()
-        query_terms = {term for term in self._tokenize(query) if len(term) > 1}
-        scored: list[tuple[int, ProjectMemoryItem]] = []
-        for memory in memories:
-            tags = json.loads(memory.tags_json) if memory.tags_json else []
-            haystack = f"{memory.title} {memory.content} {' '.join(tags if isinstance(tags, list) else [])}"
-            score = memory.importance_score
-            for term in query_terms:
-                if term in haystack:
-                    score += 2
-            if not query_terms and memory.importance_score >= 3:
-                score += 1
-            scored.append((score, memory))
-        scored.sort(key=lambda item: (item[0], item[1].updated_at), reverse=True)
-        return [memory for score, memory in scored[:5] if score > 0]
-
-    def _tokenize(self, text: str) -> list[str]:
-        normalized = text.replace("，", " ").replace("。", " ").replace("：", " ").replace("、", " ")
-        return [part.strip().lower() for part in normalized.split() if part.strip()]
-
-    def _build_template_request(self, text: str) -> StructureTemplateRequest:
-        mode = "basic"
-        if "精简" in text or "简洁" in text:
-            mode = "compact"
-        if "详细" in text or "完整" in text:
-            mode = "detailed"
-        return StructureTemplateRequest(
-            template_mode=mode,
-            include_technical_chapter=("技术" in text),
-            include_appendix_chapter=("附件" in text),
-            custom_instruction=text,
-            replace_existing=True,
-        )
 
     def _format_status_reply(self, decision: BidProjectAgentDecision, memories: list[ProjectMemoryItem]) -> str:
         memory_hint = ""

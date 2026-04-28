@@ -34,6 +34,42 @@ class AgentActionPayload(SchemaBase):
     notes: list[str] = Field(default_factory=list)
 
 
+class AgentTaskView(SchemaBase):
+    task_id: str
+    project_id: str
+    session_id: str | None = None
+    parent_task_id: str | None = None
+    depends_on_task_id: str | None = None
+    agent_name: str
+    task_type: str
+    assigned_by: str | None = None
+    task_status: str
+    blocking_reason: str | None = None
+    input_json: str | None = None
+    output_json: str | None = None
+    created_at: str | None = None
+
+
+class AgentMessageView(SchemaBase):
+    message_id: str
+    project_id: str
+    session_id: str | None = None
+    task_id: str | None = None
+    from_agent: str
+    to_agent: str
+    message_type: str
+    content: str
+    payload_json: str | None = None
+    delivery_status: str
+    created_at: str | None = None
+
+
+class AgentCoordinationTrace(SchemaBase):
+    root_task_id: str
+    tasks: list[AgentTaskView] = Field(default_factory=list)
+    messages: list[AgentMessageView] = Field(default_factory=list)
+
+
 class BidProjectAgentDecision(SchemaBase):
     project_id: str
     agent_mode: str
@@ -44,6 +80,7 @@ class BidProjectAgentDecision(SchemaBase):
     confidence: float
     action_payload: AgentActionPayload
     state_snapshot: ProjectStatusSnapshot
+    coordination_trace: AgentCoordinationTrace | None = None
 
 
 class PlanStepPayload(SchemaBase):
@@ -91,6 +128,7 @@ class AgentPlanResponse(SchemaBase):
     project_id: str
     planner_mode: str
     plan: ProjectPlanView
+    coordination_trace: AgentCoordinationTrace | None = None
 
 
 class SolveStepRequest(SchemaBase):
@@ -106,6 +144,7 @@ class SolveStepResponse(SchemaBase):
     execution_status: str
     message: str
     plan: ProjectPlanView
+    coordination_trace: AgentCoordinationTrace | None = None
 
 
 class SolveRequest(SchemaBase):
@@ -127,6 +166,7 @@ class SolveResponse(SchemaBase):
     executed_steps: list[SolveExecutionItem] = Field(default_factory=list)
     stopped_reason: str
     plan: ProjectPlanView
+    coordination_trace: AgentCoordinationTrace | None = None
 
 
 class ChatMessageItem(SchemaBase):
@@ -180,3 +220,11 @@ class AgentChatResponse(SchemaBase):
     solve_result: SolveResponse | None = None
     retrieved_memories: list[ProjectMemoryItemView] = Field(default_factory=list)
     upload_prompts: list[UploadPromptItem] = Field(default_factory=list)
+    coordination_trace: AgentCoordinationTrace | None = None
+
+
+class AgentStreamStartResponse(SchemaBase):
+    project_id: str
+    stream_id: str
+    stream_url: str
+    status: str = "started"
